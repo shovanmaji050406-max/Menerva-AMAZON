@@ -30,8 +30,8 @@ def _log(msg):
 
 from textnorm import add_clean_columns, name_tokens, addr_parts
 
-MAX_DF_S1 = 12         # drop keys shared by more S1 records than this
-MAX_DF_OTH = 45       # ... or by more S2/S3 records than this
+MAX_DF_S1 = 20         # drop keys shared by more S1 records than this
+MAX_DF_OTH = 80       # ... or by more S2/S3 records than this
 MAX_WORDS = 4
 MAX_NUMS = 3
 MAX_NAME_TOK = 4
@@ -100,11 +100,17 @@ def _build_keys(df: pl.DataFrame) -> pl.DataFrame:
     K.append(_pairs(nums, "n").select("rid", ("h" + pl.col("a") + "|" + pl.col("b")).alias("k")))
     # name token x word
     K.append(t_.join(w_, on="rid").select("rid", ("j" + pl.col("sk") + "|" + pl.col("w")).alias("k")))
+    # NAME-ONLY keys (records with empty / useless address): full name skeleton
+    # and name-token pairs.  Only survive the frequency filter for rare names.
+    full = (nt.group_by("rid", maintain_order=True).agg(pl.col("sk").sort().str.join("|").alias("g"))
+            .filter(pl.col("g").str.len_chars() >= 4))
+    K.append(full.select("rid", ("k" + pl.col("g")).alias("k")))
+    K.append(np_.select("rid", ("l" + pl.col("a") + "|" + pl.col("b")).alias("k")))
     k = pl.concat(K).unique()
     return k.select(
         pl.col("rid").cast(pl.UInt32),
         pl.col("k").hash(seed=7).alias("h"),
-        pl.col("k").str.slice(0, 1).is_in(["a", "b", "c", "d", "e", "i", "j"]).cast(pl.UInt8).alias("kind"),  # 1=uses name
+        pl.col("k").str.slice(0, 1).is_in(["a", "b", "c", "d", "e", "i", "j", "k", "l"]).cast(pl.UInt8).alias("kind"),  # 1=uses name
     )
 
 

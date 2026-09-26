@@ -43,8 +43,44 @@ def _jacc(a: str, b: str) -> pl.Expr:
     return pl.when(union > 0).then(inter / union).otherwise(0.0)
 
 
-def pair_features(pairs: pl.DataFrame, rec1: pl.DataFrame, rec2: pl.DataFrame) -> pl.DataFrame:
-    """pairs: s1_id, o_id + blocking columns.  rec1/rec2 from record_table()."""
+def name_idf_table(s1: pl.DataFrame) -> pl.DataFrame:
+    """IDF of name skeleton tokens among Source-1 records of one split, per country.
+    Common words ('group', 'india', 'trading') get low weight, distinctive
+    words get high weight."""
+    s1 = s1.with_row_index("rid")
+    c = add_clean_columns(s1.select("rid", "business_name", "business_address"))
+    t = name_tokens(c).join(s1.select("rid", "country"), on="rid")
+    n = s1.group_by("country").agg(pl.len().alias("N"))
+    return (t.group_by("country", "sk").agg(pl.col("rid").n_unique().alias("df")).join(n, on="country")
+            .select("country", "sk", (pl.col("N") / pl.col("df")).log().cast(pl.Float32).alias("idf")))
+
+
+def _idf_feats(x: pl.DataFrame, idf: pl.DataFrame) -> pl.DataFrame:
+    """Name-rarity features: how much *distinctive* name evidence is shared."""
+    base = x.select(pl.int_range(pl.len()).alias("pi"), "country", "a_sk_list", "b_sk_list")
+    maxidf = idf["idf"].max()
+
+    def total(col):
+        e = base.select("pi", "country", pl.col(col).alias("sk")).explode("sk").drop_nulls("sk")
+        e = e.join(idf, on=["country", "sk"], how="left").with_columns(pl.col("idf").fill_null(maxidf))
+        return e.group_by("pi").agg(pl.col("idf").sum().alias(col + "_w"), pl.col("idf").max().alias(col + "_max"))
+
+    sh = base.select("pi", "country", pl.col("a_sk_list").list.set_intersection(pl.col("b_sk_list")).alias("sk")).explode("sk").drop_nulls("sk")
+    sh = sh.join(idf, on=["country", "sk"], how="left").with_columns(pl.col("idf").fill_null(maxidf))
+    sh = sh.group_by("pi").agg(pl.col("idf").sum().alias("sh_w"), pl.col("idf").max().alias("sh_max"))
+    f = base.select("pi").join(total("a_sk_list"), on="pi", how="left").join(total("b_sk_list"), on="pi", how="left").join(sh, on="pi", how="left").fill_null(0)
+    f = f.sort("pi").select(
+        pl.col("sh_w").alias("name_shared_idf"),
+        pl.col("sh_max").alias("name_shared_maxidf"),
+        (pl.col("sh_w") / pl.col("a_sk_list_w").clip(lower_bound=1e-3)).alias("name_idf_cov_a"),
+        (pl.col("sh_w") / pl.col("b_sk_list_w").clip(lower_bound=1e-3)).alias("name_idf_cov_b"),
+        (pl.col("a_sk_list_max") - pl.col("sh_max")).alias("name_unshared_rare_a"),
+    )
+    return pl.concat([x, f], how="horizontal")
+
+
+def pair_features(pairs: pl.DataFrame, rec1: pl.DataFrame, rec2: pl.DataFrame, idf: pl.DataFrame = None) -> pl.DataFrame:
+    """pairs: s1_id, o_id, country + blocking columns.  rec1/rec2 from record_table()."""
     r1 = rec1.rename({c: "a_" + c for c in rec1.columns if c != "entity_id"}).rename({"entity_id": "s1_id"})
     r2 = rec2.rename({c: "b_" + c for c in rec2.columns if c != "entity_id"}).rename({"entity_id": "o_id"})
     x = pairs.join(r1, on="s1_id", how="left").join(r2, on="o_id", how="left")
@@ -88,7 +124,12 @@ def pair_features(pairs: pl.DataFrame, rec1: pl.DataFrame, rec2: pl.DataFrame) -
         pl.col("a_addr_c").str.len_chars().alias("a_addr_len"),
         pl.col("b_nonascii").cast(pl.Int8), pl.col("b_webby").cast(pl.Int8), pl.col("b_addr_null").cast(pl.Int8),
         pl.col("o_id").str.starts_with("S3").cast(pl.Int8).alias("is_s3"),
+        ((pl.col("a_num_list").list.len() > 0) & (pl.col("b_num_list").list.len() > 0)
+         & (pl.col("a_num_list").list.first() != pl.col("b_num_list").list.first())).fill_null(False).cast(pl.Int8).alias("num_first_conflict"),
+        ((pl.col("a_num_list").list.len() > 0) & (pl.col("b_num_list").list.len() > 0)
+         & (pl.col("a_num_list").list.set_intersection(pl.col("b_num_list")).list.len() == 0)).cast(pl.Int8).alias("num_no_overlap"),
     )
+    x = _idf_feats(x, idf)
     return x.select(["s1_id", "o_id"] + ROW_FEATURES)
 
 
@@ -121,6 +162,8 @@ ROW_FEATURES = [
     "sk_jacc", "sk_inter", "num_jacc", "num_inter", "num_b_extra", "num_a_extra", "w_jacc",
     "num_first_eq", "num_max_eq", "a_ntok", "b_ntok", "b_nnum", "a_nnum", "b_addr_len", "a_addr_len",
     "b_nonascii", "b_webby", "b_addr_null", "is_s3",
+    "num_first_conflict", "num_no_overlap",
+    "name_shared_idf", "name_shared_maxidf", "name_idf_cov_a", "name_idf_cov_b", "name_unshared_rare_a",
 ]
 CONTEXT_FEATURES = ["s1_ncand", "o_nanch", "blk_gap_o", "ntset_gap_o", "atset_gap_o",
                     "ntset_vs_s1mean", "atset_vs_s1mean", "sum_gap_o", "sum_gap_s1", "sum_rank_o"]
